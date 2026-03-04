@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "urdf-step-assembler"
+version = "0.1.0"
+description = "Convert URDF visual meshes into a single STEP assembly using OpenCascade XCAF."
+license = { file = "LICENSE.txt" }
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "yourdfpy==0.0.60",
+  "cadquery-ocp",
+  "trimesh>=4.0",
+]
+
+[project.scripts]
+urdf-step-assembler = "urdf_step_assembler.cli:main"
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
