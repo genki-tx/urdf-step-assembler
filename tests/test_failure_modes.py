@@ -62,3 +62,21 @@ def test_missing_mesh_without_skip_missing_fails(tmp_path: Path) -> None:
 
     assert result.returncode == 3
     assert "ERROR: Missing mesh files detected" in result.stderr
+
+
+def test_negative_decimate_max_faces_returns_error(tmp_path: Path) -> None:
+    urdf_path = tmp_path / "dummy.urdf"
+    urdf_path.write_text("<robot name='dummy'/>", encoding="utf-8")
+    cmd = [
+        sys.executable,
+        "-m",
+        "urdf_step_assembler.cli",
+        "--urdf",
+        str(urdf_path),
+        "--decimate-max-faces",
+        "-1",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    assert result.returncode == 2
+    assert "--decimate-max-faces must be >= 0" in result.stderr

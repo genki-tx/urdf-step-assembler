@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "urdf-step-assembler"
-version = "0.1.0"
+version = "0.2.0"
 description = "Convert URDF visual meshes into a single STEP assembly using OpenCascade XCAF."
 license = { file = "LICENSE.txt" }
 requires-python = ">=3.10,<3.13"

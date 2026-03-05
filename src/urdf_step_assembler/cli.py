@@ -23,7 +23,13 @@ import trimesh
 from yourdfpy import URDF
 
 from OCP.BRep import BRep_Builder
-from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform
+from OCP.BRepBuilderAPI import (
+    BRepBuilderAPI_GTransform,
+    BRepBuilderAPI_MakeFace,
+    BRepBuilderAPI_MakePolygon,
+    BRepBuilderAPI_MakeSolid,
+    BRepBuilderAPI_Sewing,
+)
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.Interface import Interface_Static
 from OCP.RWStl import RWStl
@@ -32,11 +38,13 @@ from OCP.STEPControl import STEPControl_AsIs, STEPControl_Controller
 from OCP.TCollection import TCollection_ExtendedString
 from OCP.TDataStd import TDataStd_Name
 from OCP.TDocStd import TDocStd_Document
+from OCP.TopAbs import TopAbs_SHELL
+from OCP.TopExp import TopExp_Explorer
 from OCP.TopLoc import TopLoc_Location
-from OCP.TopoDS import TopoDS_Compound, TopoDS_Face, TopoDS_Shape
+from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Face, TopoDS_Shape
 from OCP.XCAFApp import XCAFApp_Application
 from OCP.XCAFDoc import XCAFDoc_DocumentTool
-from OCP.gp import gp_GTrsf, gp_Trsf
+from OCP.gp import gp_GTrsf, gp_Pnt, gp_Trsf
 
 
 DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -101,6 +109,33 @@ def parse_args() -> argparse.Namespace:
         choices=["AP242", "AP214"],
         default="AP242",
         help="STEP schema",
+    )
+    parser.add_argument(
+        "--mesh-mode",
+        choices=["faceted", "solid", "auto"],
+        default="faceted",
+        help=(
+            "Mesh-to-BRep mode: faceted=triangle surface face, "
+            "solid=watertight solid only, auto=try solid then fallback faceted"
+        ),
+    )
+    parser.add_argument(
+        "--repair-mesh",
+        choices=["none", "basic", "aggressive"],
+        default="none",
+        help=(
+            "Attempt automatic mesh repair before solid conversion. "
+            "Only used for --mesh-mode solid/auto."
+        ),
+    )
+    parser.add_argument(
+        "--decimate-max-faces",
+        type=int,
+        default=0,
+        help=(
+            "If >0, simplify each mesh to at most this many triangle faces before export. "
+            "Useful to reduce STEP size."
+        ),
     )
     return parser.parse_args()
 
@@ -255,9 +290,91 @@ def _shape_from_triangulation(path: Path, triangulation) -> TopoDS_Shape:
     return face
 
 
-def read_mesh_shape(path: Path) -> TopoDS_Shape:
+def load_triangle_mesh(path: Path, decimate_max_faces: int) -> trimesh.Trimesh:
+    try:
+        tri_mesh = trimesh.load(str(path), force="mesh")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load mesh with trimesh: {path}") from exc
+
+    if tri_mesh is None or not hasattr(tri_mesh, "faces"):
+        raise RuntimeError(f"Unsupported mesh object: {path}")
+    if len(tri_mesh.faces) == 0:
+        raise RuntimeError(f"Mesh has no triangles: {path}")
+    if tri_mesh.faces.shape[1] != 3:
+        raise RuntimeError(f"Non-triangle faces are not supported: {path}")
+
+    if decimate_max_faces > 0 and len(tri_mesh.faces) > decimate_max_faces:
+        try:
+            simplified = tri_mesh.simplify_quadric_decimation(face_count=decimate_max_faces)
+            if (
+                simplified is not None
+                and hasattr(simplified, "faces")
+                and len(simplified.faces) > 0
+                and simplified.faces.shape[1] == 3
+            ):
+                tri_mesh = simplified
+        except Exception:
+            # Keep original mesh if decimation is unavailable or fails.
+            pass
+    return tri_mesh
+
+
+def repair_triangle_mesh(mesh: trimesh.Trimesh, repair_mode: str) -> trimesh.Trimesh:
+    mode = repair_mode.lower()
+    if mode == "none":
+        return mesh
+
+    repaired = mesh.copy()
+    # Run trimesh cleanup pipeline first; this catches common index/normal issues.
+    repaired.process(validate=True)
+    repaired.remove_unreferenced_vertices()
+    repaired.merge_vertices()
+
+    try:
+        trimesh.repair.fix_normals(repaired, multibody=True)
+    except Exception:
+        pass
+    try:
+        trimesh.repair.fix_inversion(repaired, multibody=True)
+    except Exception:
+        pass
+    try:
+        trimesh.repair.fill_holes(repaired)
+    except Exception:
+        pass
+
+    if mode == "basic":
+        return repaired
+
+    if mode != "aggressive":
+        raise ValueError(f"Unsupported repair mode: {repair_mode}")
+
+    if repaired.is_watertight:
+        return repaired
+
+    # Aggressive fallback: convex hull guarantees a closed volume but can alter shape.
+    try:
+        hull = repaired.convex_hull
+        if (
+            hull is not None
+            and hasattr(hull, "faces")
+            and len(hull.faces) > 0
+            and hull.is_watertight
+            and abs(float(hull.volume)) > 1.0e-18
+        ):
+            hull.process(validate=True)
+            hull.remove_unreferenced_vertices()
+            hull.merge_vertices()
+            return hull
+    except Exception:
+        pass
+
+    return repaired
+
+
+def read_mesh_shape_faceted(path: Path, decimate_max_faces: int) -> TopoDS_Shape:
     # Fast path for standard STL.
-    if path.suffix.lower() == ".stl":
+    if path.suffix.lower() == ".stl" and decimate_max_faces <= 0:
         triangulation = RWStl.ReadFile_s(str(path))
         if (
             triangulation is not None
@@ -267,13 +384,7 @@ def read_mesh_shape(path: Path) -> TopoDS_Shape:
             return _shape_from_triangulation(path, triangulation)
 
     # Fallback: load via trimesh (e.g. DAE or odd STL), export temp STL, then read with RWStl.
-    try:
-        tri_mesh = trimesh.load(str(path), force="mesh")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load mesh with trimesh: {path}") from exc
-
-    if tri_mesh is None or not hasattr(tri_mesh, "faces") or len(tri_mesh.faces) == 0:
-        raise RuntimeError(f"Mesh has no triangles: {path}")
+    tri_mesh = load_triangle_mesh(path, decimate_max_faces=decimate_max_faces)
 
     tmp_path: Optional[Path] = None
     try:
@@ -285,6 +396,105 @@ def read_mesh_shape(path: Path) -> TopoDS_Shape:
     finally:
         if tmp_path is not None and tmp_path.exists():
             tmp_path.unlink()
+
+
+def read_mesh_shape_solid(
+    path: Path,
+    require_watertight: bool,
+    repair_mode: str,
+    decimate_max_faces: int,
+) -> TopoDS_Shape:
+    tri_mesh = load_triangle_mesh(path, decimate_max_faces=decimate_max_faces)
+    tri_mesh = repair_triangle_mesh(tri_mesh, repair_mode)
+    if require_watertight and not tri_mesh.is_watertight:
+        raise RuntimeError(
+            f"Mesh is not watertight after repair='{repair_mode}', cannot convert to solid: {path}"
+        )
+
+    vertices = np.asarray(tri_mesh.vertices, dtype=float)
+    faces = np.asarray(tri_mesh.faces, dtype=np.int64)
+
+    sewing = BRepBuilderAPI_Sewing(1.0e-6, True, True, True, False)
+    for idx in faces:
+        p0 = vertices[int(idx[0])]
+        p1 = vertices[int(idx[1])]
+        p2 = vertices[int(idx[2])]
+
+        polygon = BRepBuilderAPI_MakePolygon()
+        polygon.Add(gp_Pnt(float(p0[0]), float(p0[1]), float(p0[2])))
+        polygon.Add(gp_Pnt(float(p1[0]), float(p1[1]), float(p1[2])))
+        polygon.Add(gp_Pnt(float(p2[0]), float(p2[1]), float(p2[2])))
+        polygon.Close()
+        if not polygon.IsDone():
+            raise RuntimeError(f"Failed to build triangle polygon from mesh: {path}")
+
+        make_face = BRepBuilderAPI_MakeFace(polygon.Wire(), True)
+        if not make_face.IsDone():
+            raise RuntimeError(f"Failed to build triangle face from mesh: {path}")
+        sewing.Add(make_face.Face())
+
+    sewing.Perform()
+    sewed = sewing.SewedShape()
+    if sewed.IsNull():
+        raise RuntimeError(f"Sewing mesh triangles failed: {path}")
+
+    solid_compound, solid_builder = create_empty_compound()
+    solid_count = 0
+    explorer = TopExp_Explorer(sewed, TopAbs_SHELL)
+    while explorer.More():
+        shell = TopoDS.Shell_s(explorer.Current())
+        make_solid = BRepBuilderAPI_MakeSolid()
+        make_solid.Add(shell)
+        if make_solid.IsDone():
+            solid = make_solid.Solid()
+            if not solid.IsNull():
+                solid_builder.Add(solid_compound, solid)
+                solid_count += 1
+        explorer.Next()
+
+    if solid_count == 0:
+        raise RuntimeError(f"No closed shell/solid could be produced from mesh: {path}")
+    if solid_compound.IsNull():
+        raise RuntimeError(f"Generated solid compound is null: {path}")
+    return solid_compound
+
+
+def read_mesh_shape(
+    path: Path,
+    mesh_mode: str,
+    repair_mode: str,
+    decimate_max_faces: int,
+) -> Tuple[TopoDS_Shape, str]:
+    mode = mesh_mode.lower()
+    if mode == "faceted":
+        return read_mesh_shape_faceted(path, decimate_max_faces=decimate_max_faces), "faceted"
+    if mode == "solid":
+        return (
+            read_mesh_shape_solid(
+                path,
+                require_watertight=True,
+                repair_mode=repair_mode,
+                decimate_max_faces=decimate_max_faces,
+            ),
+            "solid",
+        )
+    if mode == "auto":
+        try:
+            return (
+                read_mesh_shape_solid(
+                    path,
+                    require_watertight=True,
+                    repair_mode=repair_mode,
+                    decimate_max_faces=decimate_max_faces,
+                ),
+                "solid",
+            )
+        except Exception:
+            return (
+                read_mesh_shape_faceted(path, decimate_max_faces=decimate_max_faces),
+                "faceted",
+            )
+    raise ValueError(f"Unsupported mesh mode: {mesh_mode}")
 
 
 def matrix_to_gp_gtrsf(matrix: np.ndarray) -> gp_GTrsf:
@@ -390,6 +600,9 @@ def build_step_assembly(args: argparse.Namespace) -> int:
     if args.global_scale <= 0.0:
         print("ERROR: --global-scale must be > 0", file=sys.stderr)
         return 2
+    if args.decimate_max_faces < 0:
+        print("ERROR: --decimate-max-faces must be >= 0", file=sys.stderr)
+        return 2
 
     resolver = MeshResolver(urdf_path=urdf_path, mesh_root=mesh_root)
     urdf = URDF.load(str(urdf_path), load_meshes=False, build_scene_graph=True)
@@ -420,6 +633,8 @@ def build_step_assembly(args: argparse.Namespace) -> int:
     missing_meshes: List[MissingMesh] = []
     total_meshes = 0
     links_with_visuals = 0
+    solid_meshes = 0
+    faceted_meshes = 0
 
     for link in urdf.robot.links:
         link_shape, link_builder = create_empty_compound()
@@ -445,7 +660,12 @@ def build_step_assembly(args: argparse.Namespace) -> int:
                 continue
 
             try:
-                shape = read_mesh_shape(resolved_mesh)
+                shape, mode_used = read_mesh_shape(
+                    resolved_mesh,
+                    args.mesh_mode,
+                    args.repair_mesh,
+                    args.decimate_max_faces,
+                )
             except Exception as exc:
                 missing_meshes.append(
                     MissingMesh(
@@ -458,14 +678,59 @@ def build_step_assembly(args: argparse.Namespace) -> int:
                 )
                 continue
 
-            origin = np.eye(4, dtype=float) if visual.origin is None else np.array(visual.origin, dtype=float)
+            origin = (
+                np.eye(4, dtype=float)
+                if visual.origin is None
+                else np.array(visual.origin, dtype=float)
+            )
             mesh_scale = get_mesh_scale(mesh.scale)
             local_matrix = visual_local_matrix(origin, mesh_scale, args.global_scale)
-            transformed = transform_shape_general(shape, local_matrix)
-            link_builder.Add(link_shape, transformed)
+
+            try:
+                transformed = transform_shape_general(shape, local_matrix)
+                link_builder.Add(link_shape, transformed)
+            except Exception as exc:
+                if args.mesh_mode == "auto" and mode_used == "solid":
+                    try:
+                        fallback_shape = read_mesh_shape_faceted(
+                            resolved_mesh,
+                            decimate_max_faces=args.decimate_max_faces,
+                        )
+                        transformed = transform_shape_general(fallback_shape, local_matrix)
+                        link_builder.Add(link_shape, transformed)
+                        mode_used = "faceted"
+                    except Exception as fallback_exc:
+                        missing_meshes.append(
+                            MissingMesh(
+                                link=link.name,
+                                visual_index=visual_index,
+                                source_uri=mesh_uri,
+                                attempted_paths=[str(resolved_mesh)],
+                                reason=(
+                                    f"solid transform failed: {exc}; "
+                                    f"faceted fallback failed: {fallback_exc}"
+                                ),
+                            )
+                        )
+                        continue
+                else:
+                    missing_meshes.append(
+                        MissingMesh(
+                            link=link.name,
+                            visual_index=visual_index,
+                            source_uri=mesh_uri,
+                            attempted_paths=[str(resolved_mesh)],
+                            reason=str(exc),
+                        )
+                    )
+                    continue
 
             total_meshes += 1
             exported_meshes_in_link += 1
+            if mode_used == "solid":
+                solid_meshes += 1
+            else:
+                faceted_meshes += 1
 
         if exported_meshes_in_link > 0:
             links_with_visuals += 1
@@ -528,6 +793,11 @@ def build_step_assembly(args: argparse.Namespace) -> int:
     print(f"Number of links: {len(urdf.robot.links)}")
     print(f"Links with visuals exported: {links_with_visuals}")
     print(f"Meshes processed: {total_meshes}")
+    print(f"Mesh mode requested: {args.mesh_mode}")
+    print(f"Mesh repair mode: {args.repair_mesh}")
+    print(f"Mesh decimate max faces: {args.decimate_max_faces}")
+    print(f"Meshes exported as solids: {solid_meshes}")
+    print(f"Meshes exported as faceted surfaces: {faceted_meshes}")
     print(f"STEP output: {out_path}")
     if frames_json_path is not None:
         print(f"Frames JSON: {frames_json_path}")
