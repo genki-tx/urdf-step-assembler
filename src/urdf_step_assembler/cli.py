@@ -91,8 +91,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--global-scale",
         type=float,
-        default=1.0,
-        help="Uniform scale multiplier for all translations and mesh scales",
+        default=1000.0,
+        help=(
+            "Uniform scale multiplier for all translations and mesh scales "
+            "(default 1000 for URDF meters -> STEP millimeter-sized geometry)"
+        ),
     )
     parser.add_argument(
         "--frames-json",
@@ -793,6 +796,7 @@ def build_step_assembly(args: argparse.Namespace) -> int:
     print(f"Number of links: {len(urdf.robot.links)}")
     print(f"Links with visuals exported: {links_with_visuals}")
     print(f"Meshes processed: {total_meshes}")
+    print(f"Global scale: {args.global_scale}")
     print(f"Mesh mode requested: {args.mesh_mode}")
     print(f"Mesh repair mode: {args.repair_mesh}")
     print(f"Mesh decimate max faces: {args.decimate_max_faces}")
