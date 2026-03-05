@@ -21,6 +21,7 @@ It is designed to produce a standard STEP assembly with named components that ca
 - `package://`, relative, and absolute mesh URI resolution
 - FBX URI fallback to same-name STL (`.stl`/`.STL`/case-insensitive match)
 - Case-insensitive STL filename matching on Linux filesystems
+- Optional watertight mesh-to-solid conversion (`--mesh-mode solid`)
 - STEP assembly export via OpenCascade XCAF (no FreeCAD dependency)
 - Optional debug JSON dump of `T_world_link`
 
@@ -71,10 +72,54 @@ uv run urdf-step-assembler --urdf <path/to/model.urdf> [options]
 - `--base` (default `auto`): base link (`auto`/`root` uses URDF root link)
 - `--mesh-root` (default `.`): root for package/fallback mesh lookup
 - `--skip-missing`: skip missing/unloadable meshes instead of failing
-- `--global-scale` (default `1.0`): multiplies all translations and mesh scales
+- `--global-scale` (default `1000.0`): multiplies all translations and mesh scales (URDF meter values become millimeter-sized STEP geometry by default)
 - `--frames-json` (default `./build/urdf_assembly_frames.json`): debug transform output
 - `--no-frames-json`: disable frames JSON output
 - `--schema` (`AP242` default, or `AP214`): STEP schema selection
+- `--mesh-mode` (`faceted` default): `faceted`, `solid`, or `auto`
+- `--repair-mesh` (`none` default): `none`, `basic`, or `aggressive` (used for `solid/auto`)
+- `--decimate-max-faces` (`0` default): simplify each mesh to this max face count before export (`0` disables)
+
+### CAD compatibility tip
+
+Recommended stable/default strategy (best reliability and manageable file size):
+
+```bash
+--mesh-mode faceted --decimate-max-faces 1000
+```
+
+If your CAD workflow specifically requires solids, try:
+
+```bash
+uv run urdf-step-assembler \
+  --urdf <path/to/model.urdf> \
+  --out ./build/urdf_assembly.step \
+  --mesh-mode solid
+```
+
+If some meshes are not watertight, use:
+
+```bash
+--mesh-mode auto
+```
+
+This tries solid conversion first and falls back to faceted per mesh.
+
+You can also enable automatic repair before solid conversion:
+
+```bash
+--repair-mesh basic
+```
+
+`basic` runs mesh cleanup + hole filling.  
+`aggressive` adds convex-hull fallback if mesh is still open (can change geometry more).
+Treat repair modes as advanced/experimental options.
+
+If STEP is too heavy for your CAD loader, add decimation:
+
+```bash
+--decimate-max-faces 3000
+```
 
 ## Mesh Resolution Rules
 
@@ -126,6 +171,7 @@ uv run pytest -q
 Current tests cover:
 - mesh path resolver behavior (`package://`, case variants, FBX->STL fallback)
 - sample robot integration conversion
+- mesh repair and decimation option behavior
 - CLI failure paths (missing `--urdf`, missing files, missing mesh without skip)
 
 ## Project Layout
